@@ -8,20 +8,23 @@ class SystemSecurity:
         self.root = root
         if platform.system() == "Windows":
             self.user32 = ctypes.windll.user32
+            self.kernel32 = ctypes.windll.kernel32
             self.setup_hooks()
+            self.block_task_manager()
         else:
             self.user32 = None
-            self.hook_id = None
 
     def setup_hooks(self):
-        """Устанавливает хук клавиатуры только для системных комбинаций"""
+        """Устанавливает хук клавиатуры и мыши"""
 
         class KBDLLHOOKSTRUCT(ctypes.Structure):
-            _fields_ = [("vkCode", wintypes.DWORD),
-                        ("scanCode", wintypes.DWORD),
-                        ("flags", wintypes.DWORD),
-                        ("time", wintypes.DWORD),
-                        ("dwExtraInfo", ctypes.POINTER(wintypes.ULONG))]
+            _fields_ = [
+                ("vkCode", wintypes.DWORD),
+                ("scanCode", wintypes.DWORD),
+                ("flags", wintypes.DWORD),
+                ("time", wintypes.DWORD),
+                ("dwExtraInfo", ctypes.POINTER(wintypes.ULONG))
+            ]
 
         HOOKPROC = ctypes.WINFUNCTYPE(
             ctypes.c_int,
@@ -31,48 +34,72 @@ class SystemSecurity:
         )
 
         def keyboard_callback(nCode, wParam, lParam):
-            if nCode >= 0 and wParam == 0x100:  # WM_KEYDOWN
+            if nCode >= 0:
                 kbd = lParam.contents
                 vk_code = kbd.vkCode
 
-                # Проверяем состояние модификаторов
-                alt = self.user32.GetAsyncKeyState(0x12) & 0x8000  # ALT
-                ctrl = self.user32.GetAsyncKeyState(0x11) & 0x8000  # CTRL
-                win = self.user32.GetAsyncKeyState(0x5B) & 0x8000  # WIN
+                # Блокируемые клавиши:
+                # Alt+Tab, Win+Tab, Alt+F4, Ctrl+Esc, Win, Alt+Esc
+                blocked_keys = {
+                    0x09: self.user32.GetAsyncKeyState(0x12) & 0x8000,  # Tab + Alt
+                    0x73: self.user32.GetAsyncKeyState(0x12) & 0x8000,  # F4 + Alt
+                    0x1B: (self.user32.GetAsyncKeyState(0x11) | self.user32.GetAsyncKeyState(0x12)) & 0x8000,
+                    # Esc + Ctrl/Alt
+                    0x5B: True,  # Win
+                    0x5C: True  # Win (правая)
+                }
 
-                # Блокируем только конкретные комбинации:
-                if (vk_code == 0x09 and (alt or win)):  # Alt+Tab, Win+Tab
-                    return 1
-                if (vk_code == 0x73 and alt):  # Alt+F4
-                    return 1
-                if (vk_code == 0x1B and (alt or ctrl)):  # Alt+Esc, Ctrl+Esc
-                    return 1
-                if vk_code in (0x5B, 0x5C):  # Win key
-                    return 1
+                if vk_code in blocked_keys and blocked_keys[vk_code]:
+                    return 1  # Блокируем
+            return self.user32.CallNextHookEx(None, nCode, wParam, ctypes.byref(lParam.contents))
 
-            return self.user32.CallNextHookEx(self.hook_id, nCode, wParam, ctypes.byref(lParam.contents))
-
-        self.hook_proc = HOOKPROC(keyboard_callback)
+        self.keyboard_hook = HOOKPROC(keyboard_callback)
         self.hook_id = self.user32.SetWindowsHookExA(
             13,  # WH_KEYBOARD_LL
-            self.hook_proc,
+            self.keyboard_hook,
             None,
             0
         )
 
+    def block_task_manager(self):
+        """Блокирует Диспетчер задач через реестр (требует админ-прав)"""
+        try:
+            import winreg
+            key = winreg.OpenKey(
+                winreg.HKEY_CURRENT_USER,
+                r"Software\Microsoft\Windows\CurrentVersion\Policies\System",
+                0,
+                winreg.KEY_SET_VALUE
+            )
+            winreg.SetValueEx(key, "DisableTaskMgr", 0, winreg.REG_DWORD, 1)
+            winreg.CloseKey(key)
+        except Exception as e:
+            print(f"Не удалось заблокировать Диспетчер задач: {e}")
+
     def disable_window_controls(self):
-        """Отключает стандартные элементы управления окном"""
+        """Отключает элементы управления окном"""
         self.root.overrideredirect(True)
         self.root.geometry(f"{self.root.winfo_screenwidth()}x{self.root.winfo_screenheight()}+0+0")
 
-        # Блокируем опасные комбинации через tkinter
+        # Дополнительная блокировка через Tkinter
         self.root.bind("<Alt-F4>", lambda e: "break")
         self.root.bind("<Control-Alt-Delete>", lambda e: "break")
-        self.root.bind("<Escape>", lambda e: "break")
-        self.root.bind("<Alt-Tab>", lambda e: "break")
-        self.root.bind("<Meta-Tab>", lambda e: "break")
 
     def release_hooks(self):
         """Снимает все блокировки"""
-        if hasattr(self, 'hook_id') and self.hook_id and self.user32:
+        if hasattr(self, 'hook_id') and self.hook_id:
             self.user32.UnhookWindowsHookEx(self.hook_id)
+
+        # Разблокируем Диспетчер задач
+        try:
+            import winreg
+            key = winreg.OpenKey(
+                winreg.HKEY_CURRENT_USER,
+                r"Software\Microsoft\Windows\CurrentVersion\Policies\System",
+                0,
+                winreg.KEY_SET_VALUE
+            )
+            winreg.SetValueEx(key, "DisableTaskMgr", 0, winreg.REG_DWORD, 0)
+            winreg.CloseKey(key)
+        except:
+            pass
